@@ -1,0 +1,298 @@
+# Tapdata AI CLI + Mini Engine 设计
+
+> 0.1.0 最小原型已在本项目实现，命令名为 `tapdatacli`。以下保留完整目标设计，实际完成范围和验证结果请见 [IMPLEMENTATION.md](IMPLEMENTATION.md)。
+
+状态：设计提案。2026-10-23 更新首次 AI 绑定、能力保留、初始化、上下文注入与命令体系需求。已阅读本地 `tapdata/tapdata-test` 的入口、加载器、连接器执行、类型转换和启动配置；尚未实现新 CLI 或完成真实数据源验证。
+
+## 产品目标
+
+提供一个可独立安装、运行的自然语言数据工具。用户在终端描述任务，AI 理解需求、发现连接器能力、生成执行计划，再调用本地迷你引擎完成数据操作。
+
+产品核心资产是 Tapdata 数据源连接器。运行路径为 CLI → 本地引擎 → 连接器 → 数据源；不要求部署 TM、Web UI、Tapdata 服务端或其中间库。模型通过用户配置的 Provider 调用，数据源仍需网络可达并具备必要权限。
+
+独立产品不等于必须单进程或无 Java：若复用现有 Java PDK 连接器，建议以受 CLI 管理的 JVM 子进程承载。发行时评估随包携带运行时，让用户不必手工部署完整 Tapdata。具体 JRE 版本和包体积待依赖验证后决定。
+
+## 架构与职责
+
+```text
+终端 UI / 确定性子命令
+          │
+    AI Binding + Provider Adapter
+    外部 CLI Agent / 内置 API Agent
+    会话、模型选择、流式事件、工具调用
+          │
+    Command Registry / 结构化工具 API / JobSpec
+    自然语言、斜杠命令、脚本共用；校验与执行授权
+          │ 本地 IPC
+    Mini Engine（建议 JVM 子进程）
+    连接器生命周期、数据搬运、任务状态、位点
+          │
+    PDK Adapter + 按需加载的连接器
+          │
+    数据库 / 文件 / SaaS 等数据源
+```
+
+AI 在控制路径上；批量数据传输由引擎执行。大批量记录不经过模型上下文。用户需要模型分析数据时，单独选择必要的样例或聚合结果。
+
+CLI 和脚本命令共用工具 API。MCP 可以作为未来对外开放同一能力的适配层，不作为内部必经依赖。tapshell 和现有 MCP 仅供参考。
+
+## 技术栈建议：TypeScript + Java
+
+建议采用 TypeScript（Node.js）实现 CLI、AI 适配器、Command Registry 和本地配置；Java 实现 Mini Engine、PDK 适配和连接器运行。终端组件框架暂不锁定，先用原型验证中文输入、多行粘贴、流式渲染和滚动体验。
+
+这里的“调用 Java”采用独立 JVM 进程加结构化 IPC，不在 Node.js 内嵌 JVM，也不为每条命令新建 JVM。引擎按需启动，在工作区运行期间复用连接器和元数据；进程所有权由运行管理器统一控制，多个脚本调用经本地端点复用实例。跨终端退出后持续运行的 daemon 模式另行设计，首版不隐含承诺。
+
+首个单客户端原型建议使用 stdin/stdout 上的逐行 JSON（JSON-RPC 2.0 请求、响应和通知）：请求带 ID，长任务先返回句柄，再通过通知推送进度、完成、失败和取消结果。stdout 仅用于协议，日志送 stderr；需验证连接器输出不会污染协议，不能保证时改用独立本地通信端点。脚本复用实例时增加用户专属的本地 socket / named pipe 接入，避免多个客户端争用 stdio。两种传输共用同一方法与事件定义。
+
+跨进程只传控制指令、结构、限定样例、任务状态和节流后的进度；全量记录从 Java 源连接器直接流向 Java 目标连接器或文件输出。连接器内部 offset 保留在 Java 状态层，外部只传状态引用。表结构、计数和样例需明确大整数、decimal、时间和二进制的编码，避免 JavaScript number 导致精度损失；限制单条消息大小，对模型和表列表提供分页。
+
+通信契约独立版本化，采用可校验 schema 并生成 TypeScript / Java 类型；握手检查协议与引擎版本、就绪状态和能力。超时与取消分开，超时不自动重放有副作用的请求；任务通过 taskId / runId 查询真实状态。进程异常时 CLI 保持可用，显示受影响操作和恢复入口，不将进程重启视为任务成功恢复。
+
+Java 17 作为基于 tapdata-test 的初始候选，最终运行时版本由所选 PDK 和连接器依赖验证决定。发行按操作系统与 CPU 架构打包或按需获取受管理的运行时、引擎和连接器，下载需有进度和可重试反馈；不让用户手工部署 TM 或完整 Tapdata 平台。随包 JRE 的兼容性、体积和分发条件列入打包验证。
+
+首个技术验证闭环：TypeScript 启动 Java → 握手 → 装载一个真实 JAR → test → discover → 有限采样 → 取消与关闭。验证通过后，再接单表导出与完整自然语言流程。本节为架构建议，尚未验证进程通信、打包或真实连接器执行。
+
+## 本轮确定的产品要求
+
+以下是用户已提出的要求；具体参数拼写、存储布局和适配技术为本设计建议，可以继续迭代。
+
+| 编号 | 产品要求 | 设计落点 |
+| --- | --- | --- |
+| R01 | 首次启动允许绑定 Codex、Claude 等 CLI，或 API URL + API Key | 首次运行向导、AI Binding、Provider Adapter |
+| R02 | 绑定后继续使用 AI 工具的模型选择等基本能力 | 适配器能力声明、模型选择器、原生能力入口 |
+| R03 | 必要初始化支持显式 init 或后台自动完成 | 幂等初始化、就绪状态和修复入口 |
+| R04 | 向 AI 提供 Tapdata CLI 上下文、skill 或 hook，理解自然语言并形成原始命令 | Command Registry、上下文包、provider 注入适配 |
+| R05 | /connector 支持 load / unload / update / list；先用 JAR，后续 Maven | 插件制品、版本、PDK 标识和引用管理 |
+| R06 | /datasource 支持 create / modify / drop / list / test / load | PDK 配置 schema、JSON / key=value、连接名引用 |
+| R07 | /task 后续参考 Tapdata / tapshell 能力持续设计 | 先定义任务命令边界，后续逐项补充 |
+
+## AI 绑定、能力保留与初始化
+
+### 首次运行与绑定配置
+
+首次运行 `tapdata` 展示绑定向导，提供“Codex CLI”“Claude CLI”“自定义 API（中转站 / DeepSeek 等）”和“稍后配置，先使用命令”。绑定完成后直接进入工作区；以后只在配置缺失或失效时提示。可保存多个命名绑定并选择默认绑定，避免为切换 AI 重新配置数据源。
+
+- **CLI 绑定**：检测可执行文件、版本、登录状态与可接入能力；允许指定命令路径和参数。优先使用所绑定工具自己的认证方式，缺失登录时展示其登录入口；不读取并复制它的账号凭据。CLI 不存在时保留向导状态并提示安装或选择其他方式。
+- **API 绑定**：配置名称、`apiUrl`、`apiKey`、协议与模型 ID。不能仅凭 URL 假设中转站完整兼容；首版优先适配 OpenAI-compatible Chat Completions，Responses 等协议按适配器明确声明。模型列表可发现时使用发现结果，列表接口不可用时允许手填模型 ID。验证连接、模型可用性和工具调用支持分别反馈。
+- **持久化**：绑定配置与模型默认值保存在用户目录，API Key 使用本地凭据存储引用；无系统凭据服务时可用环境变量引用。展示和日志不回显密钥。绑定失败允许修改后重试，无需重做其他初始化。
+
+建议管理入口：`/ai bind|list|use|status|unbind`、`/model` 和对应 `tapdata ai ...` / `tapdata model ...`。`/ai unbind` 仅移除 Tapdata 的绑定，不执行外部工具账号注销。
+
+### 两类运行模式与能力保留
+
+**外部 CLI 模式**：复用 Codex / Claude 的 Agent、会话和工具能力，由 Tapdata 管理自己的界面与数据命令。优先使用官方结构化集成接口；普通交互终端不作为可稳定解析的协议。必要时提供进入原生 CLI 的入口，终端所有权明确交接并在返回后恢复 Tapdata 界面。
+
+**直连 API 模式**：Tapdata 自己维护 Agent 循环、工具分发、会话与错误恢复；API 仅提供模型推理。API Key 并不自动带来 Codex / Claude 的完整工具能力。无工具调用能力时可采用经过 schema 校验的结构化命令提案；无法可靠生成提案时保留问答及手动命令入口，不把文本当作执行成功。
+
+适配器需报告 `models`、`modelSwitch`、`reasoningOptions`、`streaming`、`resume`、`cancel`、`toolCalls`、`nativeEntry` 等能力及限制。模型、推理设置、登录状态、用量信息在后端可提供时展示；不可用的项明确说明原因。Tapdata 的 `/model` 由本地路由处理，不能原样透传并假定它与外部 CLI 的斜杠命令一致。
+
+切换模型在当前回答结束后或明确中断后生效。跨 provider 切换创建新的 provider 会话，携带脱敏摘要与当前 Tapdata 上下文，不承诺外部 Agent 内部历史无损迁移；已运行的引擎任务不随 AI 切换而重新执行。
+
+**已核对的 Codex 集成依据**：官方 [App Server 文档](https://learn.chatgpt.com/docs/app-server) 提供结构化会话、流式事件、`model/list`、skill 输入及执行审批事件，可作为适配器候选；能力和版本仍需实际集成验证。Claude CLI 的具体 SDK / 协议、认证与能力映射列为适配验证项，本轮不假定其与 Codex 对称。原生模式可提供补充入口，但不能替代在 Tapdata 内完成自然语言数据任务的验收要求。
+
+### 显式与自动初始化
+
+建议支持 `tapdata init` / `/init`。无参数时初始化缺失项并进入必要的绑定步骤；`--repair` 检查并修复本产品管理的运行资源。初始化分为本地目录和状态、引擎准备、AI 绑定与 Tapdata 上下文准备，互不绑定成一个不可恢复的大步骤。
+
+创建目录、注册内置命令、生成本产品上下文包等可后台幂等执行；凭据和 provider 选择需要输入时转前台。耗时操作显示紧凑状态，失败显示原因、影响及重试入口。初始化不会覆盖外部 CLI 的全局配置，也不以后台无感知为由隐式安装或升级用户的 AI 工具。
+
+分别维护 `coreReady`、`engineReady`、`aiReady`、`contextReady`。AI 未就绪时仍可管理连接器与数据源；引擎未就绪时仍可绑定 AI。只初始化当前命令需要的部分，避免普通帮助命令等待 JVM 启动。
+
+## 自然语言到原始命令：共享定义与上下文
+
+三种入口共享一份 Command Registry：
+
+```text
+自然语言 → 外部 CLI Agent / 内置 API Agent → 结构化命令调用 ┐
+/connector、/datasource、/task → 本地解析器              ├→ Command Registry → Mini Engine
+ tapdata connector|datasource|task ... → 脚本解析器     ┘
+```
+
+Registry 为每条命令定义名称、参数 schema、帮助、示例、返回结构、能力要求及副作用。帮助、补全、AI 工具定义和 skill 中的命令参考从这里生成，避免维护三套语义。AI 可以展示等价的原始命令供复用；执行优先传递命令名和结构化参数，不拼接任意 shell 字符串。
+
+向 AI 提供的上下文分为三层：
+
+1. **稳定操作知识**：产品边界、命令 schema 与版本、典型工作流、错误处理及“未收到真实结果不能宣称成功”等规则。
+2. **动态工作区摘要**：当前连接器与版本、pdkId、脱敏连接列表、模型加载状态、所选数据源 / 表、任务 ID 与计划版本。大规模 schema 按需查询。
+3. **实时执行反馈**：结构化结果、错误码、建议下一步、长操作句柄与进度。工具返回结果继续交给 Agent，支持多轮补参、纠错和串联命令。
+
+实现“Tapdata 上下文包”，按 provider 支持的机制注入会话说明、skill 或 hook。Skill 说明如何操作，hook 用于确有支持的会话启动、刷新等生命周期；命令执行的校验仍由 Registry 完成。首版无需同时实现三种注入机制，但必须验证支持的每种 AI 绑定都能取得上下文并实际调用命令。
+
+上下文包归 Tapdata 管理，记录版本与命令 schema 指纹；连接器装载、数据源修改、模型加载及 provider 切换时刷新动态摘要。外部原生模式使用相应 workspace 的说明 / skill 接入，避免覆盖用户现有文件。仅复制一个 skill 文件不等于接入成功，需验证发现、注入与执行反馈。
+
+已绑定 CLI 可通过绝对路径的 `tapdata ... --output json` 调用同一命令服务；适配器支持结构化工具时直接分发 Registry。命令会话传递明确 workspace 与访问范围，复用同一个引擎，避免每次工具调用启动不同运行实例。MCP 仍为可选适配层。
+
+凭据参数使用本地表单或引用，模型只获得引用；自然语言里的连接名须先解析为稳定 ID。命令结果统一为 `requestId`、`ok`、`data` 或 `error{code,message,details,retryable}`，长操作返回 `operationId` / `taskId`。脚本模式不输出 TUI 控制字符；stdout 放结构化结果，诊断放 stderr，失败使用非零退出码。未提供必要参数时，TTY 可补参，非 TTY 返回明确缺失字段。
+
+## 原始命令体系
+
+下表中的斜杠写法用于交互界面，脚本形式去掉斜杠并加 `tapdata` 前缀。例如 `/datasource test crm` 等价于 `tapdata datasource test crm`。输入 `/connector`、`/datasource`、`/task` 不带子命令时打开该分组的帮助与操作面板。
+
+### /connector：制品与运行时管理
+
+| 命令 | 语义与关键参数 |
+| --- | --- |
+| `/connector load --jar <path>` | 从本地 JAR 及必要依赖装载连接器，验证并返回 connectorId、pdkId、版本、配置 schema 和能力 |
+| `/connector unload <connector-ref>` | 卸载指定运行版本；有活动连接实例或任务引用时返回引用清单，先释放后卸载 |
+| `/connector update <connector-ref> --jar <path>` | 校验新包后更新可用版本；失败保留旧版本，运行任务固定旧版本 |
+| `/connector list` | 展示标识、版本、来源、装载状态、实际能力及引用数 |
+| `/connector describe <connector-ref>` | 补充入口：展示配置要求、能力、兼容状态与依赖信息 |
+
+`load` 与 `update` 首版使用本地 JAR；非单体包需允许显式依赖目录，具体参数待打包验证。`pdkId` 从制品元数据 / 注解提取并校验，不由模型猜测。一个制品包含多个实现或同一 pdkId 存在多个版本时，展示可选择列表，并以 connectorId / 版本精确引用；本轮不假定 pdkId 单独即可唯一定位。
+
+更新后不自动迁移已有数据源和任务。数据源绑定精确制品版本；经兼容校验和显式修改后，新的运行实例才使用新版本。卸载保留连接配置及制品登记，明确标为未装载；不把 unload 等同于删除 JAR。重新加载同一内容可幂等返回，替换制品必须走 update。
+
+后续增加 Maven 坐标来源，例：`/connector load --maven <groupId:artifactId:version>`。此为预留语法，不代表现有正式制品已经可下载。制品解析层统一处理本地与 Maven 的版本、缓存、校验和及兼容性，始终固定具体版本供任务引用。
+
+### /datasource：连接配置、测试与模型加载
+
+| 命令 | 语义与关键参数 |
+| --- | --- |
+| `/datasource create <name> --pdk-id <id> [--connector <ref>] --config <file.json>` | 从已装载连接器获得配置要求，创建命名连接；多版本时要求明确 connector 引用 |
+| `/datasource create <name> --pdk-id <id> --set <key=value> ...` | 使用重复 key=value 配置；与 JSON 可组合使用 |
+| `/datasource modify <name> [--config <file.json>] [--set <key=value> ...]` | 局部更新配置，返回脱敏变更摘要与新 revision |
+| `/datasource drop <name>` | 删除本地连接定义和所属模型缓存；不删除数据库、表或业务数据 |
+| `/datasource list` | 列出连接名、稳定 ID、连接器版本、最近测试状态和模型加载状态 |
+| `/datasource test <name>` | 按连接名调用连接测试，逐项展示检查结果，保留配置便于修正 |
+| `/datasource load <name> [--refresh]` | 发现并缓存该连接的数据库 / schema / 表 / 字段等模型，不读取整表业务数据 |
+| `/datasource describe <name> [--table <qualified-name>]` | 补充入口：查看脱敏配置或已加载的表结构 |
+
+输入配置的优先级建议为：连接器默认值 → JSON → 显式 `--set`；modify 在已有配置上应用输入 patch，未出现的字段保留。字段类型、必填项、默认值与敏感属性依据连接器声明校验，JSON 提供复杂结构；不把所有 key=value 永久存成字符串。修改可使测试和模型缓存失效，保留旧缓存时标记 stale，刷新成功后替换；失败不显示为最新模型。
+
+连接名在 workspace 内唯一，包含空格时使用引号；同名冲突不静默覆盖。create 返回 datasourceId、name、pdkId、connectorRef 与 revision，后续 test / load 可直接引用名字。脚本必须明确名字或 ID，交互界面可由选择器补齐。
+
+create 默认只保存合法配置；“创建并测试、加载模型”由向导或自然语言串联 create → test → load，逐步展示真实结果。test 成功不代表 load 已完成；load 成功也不代表具有读取、写入或 CDC 的全部权限。测试不通过时可保留连接并再次 modify / test。
+
+drop 若被活动操作或任务引用，返回依赖清单；不级联删除任务。连接配置修改生成新 revision，运行任务使用启动时固定的版本，不静默切换凭据或目标。采样是独立数据读取能力，不复用 load 的名称。
+
+### /task：预留任务管理分组
+
+后续随用户任务需求继续细化；当前仅约定候选命令：`create / modify / list / describe / start / stop / status / monitor / logs / stats / drop`。create 保存可校验的计划，start 启动一次运行并返回 taskId、runId、planVersion；修改不会改变正在执行的版本，stop 对接实际取消确认。
+
+参考本地 tapshell 的 `start / stop / status / monitor / logs / stats` 操作语义（`/home/t-layer3-test/tapshell/tapdata_cli/cli.py:124` 起），不复用其平台 HTTP 运行依赖。reset、resume、CDC、任意 DAG、调度等必须在 mini engine 支持并明确数据影响后再开放；“参考现有能力”不等于首版全部兼容。
+
+对外统一用 task 表示用户任务；内部原有 JobSpec / jobId 可暂保留，通过 taskId / runId 映射，避免界面混用 job 与 task。具体任务参数、运行记录保留策略及脱离终端后持续运行方式留待后续需求确定。
+
+## 首版用户体验
+
+```text
+$ tapdata
+
+> 连接本地 MySQL，看看有哪些客户表
+  根据连接器配置补齐地址、数据库和凭据
+✓ 测试连接
+✓ 发现表结构
+  找到 customers、customer_contacts
+
+> 看看 customers 的结构和几条样例
+✓ 展示字段、主键、数据类型和限定数量的样例
+
+> 把 customers 导出为 CSV，不要手机号
+  计划：crm.customers → ./customers.csv
+  字段：排除 phone
+  模式：一次性全量
+  已有文件处理：在执行前按用户意图确定
+
+> 执行
+✓ 引擎启动作业，持续展示真实读写计数与错误
+✓ 完成后显示输出路径和执行摘要
+```
+
+后续可支持“把这个表复制到 PostgreSQL”“保持实时同步”“检查两边的数据差异”。每项任务必须依据所选连接器的实际能力判断是否可执行，不能把自然语言入口等同于所有数据操作均已实现。
+
+## Mini Engine 采用 tapdata-test 的运行方式
+
+以 `/home/tapdata/tapdata-test` 为实现蓝本：直接加载连接器 JAR，实例化 `TapConnector`，构造 PDK Context，注册并调用能力。保留独立 JVM 进程，由新 CLI 管理其生命周期；不复用测试器的 Scanner 命令交互，不引入完整平台任务运行链路。
+
+### 已阅读的源码与可复用路径
+
+| 源码位置（相对 tapdata-test） | 实际实现 | 新产品中的用途 |
+| --- | --- | --- |
+| `pom.xml` | Java 17；依赖 tapdata-api、pdk-api、pdk-runner、tapdata-common；Shade 打包 | 独立引擎打包的起点；独立运行仍需这些库及传递依赖 |
+| `HotLoadConnectorTester.java:312` | 加载 JAR、扫描带 `@TapConnectorClass` 注解的实现、默认构造、创建连接上下文、`registerCapabilities` | ConnectorRuntime 的加载与能力发现 |
+| `DependencyURLClassLoader.java` | 优先从连接器加载类，失败再委托父加载器 | 插件隔离参考；补充公共 API 类身份和版本兼容验证 |
+| `HotLoadConnectorTester.java:482` | 直接调用 `connectionTest`，逐项接收检查结果 | 连接测试事件与结构化返回 |
+| `HotLoadConnectorTester.java:521` | `init` → `getBatchReadFunction` → 回调 events/offset → `stop` | 全量读取适配器 |
+| `HotLoadConnectorTester.java:613` | 表映射、时间戳转增量位点、`StreamReadConsumer`、release/stop | 后续增量读取参考 |
+| `HotLoadConnectorTester.java:876` | 建表能力、写入策略、`WriteRecordFunction` 和结果回调 | 目标写入适配器；去除压测造数逻辑 |
+| `HotLoadConnectorTester.java:1233` | 从连接器 JSON 提取 dataTypes；使用类型生成器与 codec | 表结构映射和记录转换的基础 |
+| `HotLoadConnectorTester.java:1407` | 临时切换线程上下文 ClassLoader，再恢复 | 统一包裹所有插件调用及其工作线程 |
+| `JvmArgInjector.java` | 拉起带模块开放参数的子 JVM | 启动参数参考，按实际连接器验证必要参数 |
+
+### 沿用模式，补齐任务运行能力
+
+静态检查发现以下具体缺口；它们限定了可直接复用的范围，并非真实数据源运行测试结论：
+
+- **元数据发现缺失。** 未找到 `discoverSchema` 调用；`tapTableCache` 只在写入压测中放入人工表。独立读取需要先发现真实表结构，按连接隔离缓存。
+- **状态为空实现。** 静态 `KVMap` 不存取任何内容；批量读取始终传入 null offset。需要实际状态容器，并区分连接器内部状态与任务恢复位点。
+- **读取与写入分离。** 读取仅统计事件，写入由 `getPerformanceEvents` 生成测试数据。需要新增真实的 source → transform → sink 管道、有界缓冲与背压。
+- **连接测试结果未汇总。** 检查项仅写日志，正常路径返回 null。需要保留每项成功、警告和失败，供 CLI 展示和 Agent 判断。
+- **错误和退出需收敛。** 部分异常只记录日志；增量测试在首条记录到达前没有总等待期限；取消后没有完整等待线程退出。必须返回明确失败状态，统一超时、取消和清理。
+- **资源生命周期需统一。** 当前卸载主要关闭 ClassLoader，部分调用可能重复 stop/release。新引擎需跟踪运行实例，在任务退出后释放连接、线程与加载器。
+- **类型能力需真实验证。** 已有结构映射和压测数据转换，不代表跨库真实记录已完成双端 codec 转换。需用真实字段值校验精度、时间和二进制类型。
+
+新引擎建议拆成 ConnectorRuntime、MetadataService、TransferJob、JobRegistry、StateStore 和 EventPublisher。第一版只需要少量可验证的连接器和单表任务，不需要完整 TM 调度体系。
+
+## Mini Engine 的最小职责
+
+| 能力 | 首版范围 |
+| --- | --- |
+| 插件与连接 | 固定版本的少量连接器，加载、初始化、停止、连接测试 |
+| 元数据与能力 | 列表、字段、主键、实际支持的读取与写入操作 |
+| 数据读取 | 单表分批全量读取、有限采样、读取上限与取消 |
+| 数据处理 | 字段选择、重命名、明确的数据类型转换；过滤仅在实现支持后开放 |
+| 数据输出 | CSV 文件输出；随后增加一个数据库目标写入 |
+| 作业控制 | 启动、状态、进度、取消、错误摘要和资源释放 |
+| 本地持久化 | 作业描述、状态、兼容的位点记录、脱敏日志 |
+| 流量控制 | 有界缓冲、背压，避免整表装入内存 |
+
+首版不引入分布式调度、集群容错、任意 DAG、多表关联、完整 TM 管理体系或全连接器兼容承诺。
+
+位点恢复需按连接器验证。数据库写入必须检查批次和逐条失败结果；目标写入确认后才能推进可恢复位点。源与目标缺少共同事务时，崩溃恢复可能重复投递，是否能做到幂等取决于目标能力、主键和写入策略，不能仅凭保存 offset 宣称 exactly-once。
+
+实时 CDC 单列为第二阶段：还需处理全量到增量的一致性衔接、源日志保留、位点持久化、重启、目标幂等和长时间运行。第一阶段的全量断点不代表 CDC 已完成。
+
+## Agent 工具边界
+
+内部工具由 Command Registry 生成，使用统一命名：
+
+- `connector.load/unload/update/list/describe`。
+- `datasource.create/modify/drop/list/test/load/describe`。
+- `tables.list` / `tables.describe` / `data.sample`：在命名数据源上发现和理解数据。
+- `task.create/start/status/stop` 等：依已实现的引擎能力逐项开放。
+
+此前草案中的 connections / jobs 名称仅为早期内部占位，后续收敛到 datasource / task，避免 Agent 与终端使用两套概念。
+
+`JobSpec` 至少描述源和目标引用、表、字段投影、读取模式、目标处理策略、批大小和连接器版本。运行时检查能力并返回结构化错误，模型不能通过生成任意命令绕过能力约束。
+
+通用 SQL 不是所有连接器共有能力；以后按能力显式开放。生成的 SQL 或转换程序也必须走独立执行接口，不能把模型输出直接作为任意本地代码运行。
+
+凭据由本地输入与凭据通道处理，模型只接收凭据引用。数据源文本属于数据；会话保留脱敏参数和摘要。取消请求须等待引擎反馈实际状态，不能把停止生成当作作业已停止。
+
+## 实施方式：CLI 体验与引擎并行推进
+
+用户体验是主线之一，不能等引擎全部完成后再加一个聊天壳。详细交互范围见 [CLI-EXPERIENCE.md](./CLI-EXPERIENCE.md)。
+
+1. **确定交互与协议。** 先定义首次 AI 绑定、模型切换、显式与自动初始化、命令 Registry 和上下文包，再定义连接器管理、命名数据源、发现、预览、计划、运行、取消、失败的完整流程，以及请求、返回值、任务事件和错误结构。
+2. **制作可运行的终端体验原型。** 使用明确标识的模拟事件覆盖正常、慢响应、无结果、连接失败、部分写入和取消。先验证首次绑定、模型选择、斜杠命令补全、输入、滚动、任务展示和多轮计划修改。
+3. **同时提取连接器运行内核。** 按 tapdata-test 的直接调用路径，接通一个真实连接器的加载、连接测试、元数据、有限读取和关闭；通过同一协议替换模拟实现。
+4. **接通端到端任务。** 单表 → CSV，支持字段排除、真实进度、有界内存、取消和可核验输出；Agent 和确定性命令调用同一套能力。
+5. **增加数据库目标，再验证 CDC。** 先完成真实记录转换、目标写入结果和失败语义；CDC 的全量增量衔接、持久位点与后台生命周期独立验收。
+
+首版验收同时覆盖功能和交互：用户无需部署 Tapdata 平台，能通过自然语言连接真实数据源、查看结构和样例、修改导出计划并完成单表导出；执行期间可继续输入和查看状态，错误后能沿用已有上下文继续操作，取消状态与真实任务一致。
+
+## 本轮新增验收与待验证项
+
+- 分别验证 Codex CLI、Claude CLI、自定义 API 三类绑定能在 Tapdata 内完成“自然语言 → 原始命令 → 实际反馈”；失效绑定可修复，跳过 AI 绑定仍可手动操作。
+- 模型选择使用适配器返回的能力，支持 API 手填模型；切换不重复执行已有任务。外部工具特有设置保留可达入口，未支持项如实说明。
+- 首次自动初始化与重复 init 结果一致；耗时步骤可见、失败可重试，外部用户配置保持完整。
+- 本地 JAR load 返回真实 pdkId；错误包、依赖不足、版本冲突、带引用 unload / update 均有可操作反馈。
+- JSON 与 key=value 均可创建和修改连接；同一连接名可 list → test → load → describe；缺少权限、空模型及刷新失败分别展示。
+- 同一操作经自然语言、斜杠命令和脚本执行具有一致语义、结果与错误；上下文随动态配置刷新，帮助与工具 schema 同源。
+
+待实现验证：外部 CLI 版本 / 集成接口与能力矩阵、API 中转站协议差异及工具调用兼容性、JAR 配置 schema 的实际解析与依赖打包、多版本 ClassLoader 隔离。Maven 正式制品分发及详细 task 能力属于后续迭代。本轮仅更新设计，未执行 AI 绑定、下载安装或真实连接操作。
+
+
+## 本地开发操作补充（2026-10-23）
+
+自然语言能力增加宿主管理的 `local exec --cwd DIR --argv JSON_ARRAY [--timeout SECONDS]`，用于用户要求的文件检查、Maven/npm 编译和打包。Codex、Claude、API 共用此能力，provider 本身仍只生成经校验的命令提案。宿主展示命令与限量日志，回传实际退出码、输出尾部和完整日志路径；失败后由模型根据真实错误决定后续操作，不宣称成功。默认不经过 shell；继承当前用户权限和环境，不提供本地执行沙箱。提示词限定用户授权范围，文件和工具输出作为不可信数据。Ctrl+C 取消回答及本地进程，POSIX 下停止进程组；数据任务仍独立取消。完整日志保存为私有文件，本地命令参数不写交互历史。编译连接器优先选择所需模块及依赖，成功后重新 discover 用户指定的 dist 目录。

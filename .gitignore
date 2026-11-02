@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+dist/
+build/
+
+# Compiled Java
+target/
+*.class
+
+# Test artifacts
+.oracle-it-work/
+*.log
+
+# Config and secrets
+.tapdatacli/
+*.env
+
+# Package outputs
+*.tgz
+*.tar.gz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/

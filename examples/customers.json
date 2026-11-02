@@ -1,0 +1,1 @@
+{"customers":[{"id":1,"name":"张三","email":"zhang@example.com","phone":"13800000001"},{"id":2,"name":"李四","email":"li@example.com","phone":"13800000002"},{"id":3,"name":"王五","email":"wang@example.com","phone":"13800000003"}],"orders":[{"id":101,"customer_id":1,"amount":88.5},{"id":102,"customer_id":2,"amount":126.0}]}

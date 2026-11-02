@@ -1,0 +1,8 @@
+{
+  "name": "tapdatacli", "version": "0.1.0", "description": "Independent AI data CLI with a Java PDK mini engine",
+  "type": "module", "bin": {"tapdatacli": "bin/tapdatacli.mjs"},
+  "engines": {"node": ">=22"},
+  "files": ["bin", "dist", "runtime", "examples", "README.md", "docs"],
+  "scripts": {"build": "node scripts/build.mjs", "build:ts": "tsc", "start": "node bin/tapdatacli.mjs", "test": "npm run build:ts && node --test test/*.test.mjs", "package": "npm run build && npm pack", "bundle": "npm run build && node scripts/bundle.mjs"},
+  "devDependencies": {"@types/node": "^22.0.0", "typescript": "~5.9.3"}
+}

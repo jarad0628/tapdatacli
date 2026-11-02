@@ -1,0 +1,1 @@
+{"properties":{"id":"local-json","name":"Local JSON","group":"io.tapdata.mini","version":"0.1.0"},"configOptions":{"connection":{"type":"object","properties":{"path":{"type":"string","title":"JSON file path"}},"required":["path"]}},"dataTypes":{}}
