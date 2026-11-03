@@ -52,38 +52,56 @@ export class Nexus {
         }
         return response;
     }
+    private repositoryUrl(path = '') {
+        return new URL(`${encodeURIComponent(this.repository)}/${path}`, this.base);
+    }
+    private async directoryEntries(url: URL, signal?: AbortSignal): Promise<{ name: string; directory: boolean }[]> {
+        let response: Response;
+        try { response = await this.request(url, signal); }
+        catch (e) { if (e instanceof Error && e.message.startsWith('Nexus HTTP 404')) return []; throw e; }
+        const html = await response.text();
+        const entries: { name: string; directory: boolean }[] = [];
+        for (const match of html.matchAll(/<li class=["'](directory|file)["'][^>]*>\s*<a href=["']([^"']+)["'][^>]*>([^<]+)<\/a>/gi)) {
+            const directory = match[1].toLowerCase() === 'directory';
+            const href = match[2].replace(/&amp;/g, '&');
+            const name = match[3].trim().replace(/\/$/, '');
+            if (!name || name === 'Parent Directory') continue;
+            const target = new URL(href, url);
+            if (target.origin !== this.base.origin || !target.pathname.startsWith(url.pathname)) throw new Error('Repository index returned an untrusted path');
+            entries.push({ name, directory });
+        }
+        return entries;
+    }
+    private async sha256(url: URL, signal?: AbortSignal) {
+        const response = await this.request(url, signal);
+        const digest = (await response.text()).trim().split(/\s+/)[0]?.toLowerCase();
+        if (!/^[a-f0-9]{64}$/.test(digest ?? '')) throw new Error(`Invalid SHA-256 file at ${url.pathname}`);
+        return digest;
+    }
     async search(name?: string, version?: string, signal?: AbortSignal): Promise<RemoteConnector[]> {
         const artifact = name ? connectorName(name) : undefined;
         const found: RemoteConnector[] = [];
-        const tokens = new Set<string>();
-        let token: string | undefined;
-        do {
-            const url = new URL('service/rest/v1/search', this.base);
-            url.searchParams.set('repository', this.repository);
-            url.searchParams.set('group', 'io.tapdata');
-            url.searchParams.set('sort', 'version'); url.searchParams.set('direction', 'desc');
-            if (artifact) url.searchParams.set('name', artifact);
-            if (version) url.searchParams.set('version', version);
-            if (token) url.searchParams.set('continuationToken', token);
-            const page: any = await (await this.request(url, signal)).json();
-            if (!Array.isArray(page.items)) throw new Error('Invalid Nexus search response');
-            for (const item of page.items) {
-                if (item.group !== 'io.tapdata' || !/^[a-z0-9][a-z0-9._-]*-connector$/.test(item.name) || (artifact && item.name !== artifact) || (version && item.version !== version)) continue;
-                for (const asset of item.assets ?? []) {
-                    // Only the runnable main JAR; never sources, javadoc, tests or arbitrary classifiers.
-                    if (asset.maven2?.extension !== 'jar' || asset.maven2?.classifier) continue;
-                    const download = new URL(asset.downloadUrl);
-                    const prefix = new URL(`repository/${this.repository}/io/tapdata/`, this.base);
-                    if (download.origin !== this.base.origin || !download.pathname.startsWith(prefix.pathname) || download.username || download.password || download.search || download.hash)
-                        throw new Error('Nexus returned an untrusted download URL');
-                    if (!/^[a-f0-9]{64}$/i.test(asset.checksum?.sha256 ?? '')) throw new Error('Nexus artifact is missing SHA-256');
-                    found.push({ artifactId: item.name, group: item.group, version: item.version, repository: this.repository, url: download.href, sha256: asset.checksum.sha256.toLowerCase(), size: asset.fileSize });
-                }
+        // nexus.tapdata.net publishes Maven artifacts through the /<repo>/ layout
+        // (Reposilite index); its Nexus REST search endpoint can return an empty
+        // catalog for artifacts that are directly downloadable from that layout.
+        const root = this.repositoryUrl('io/tapdata/');
+        const artifacts = artifact ? [{ name: artifact, directory: true }] : (await this.directoryEntries(root, signal))
+            .filter(x => x.directory && /^[a-z0-9][a-z0-9._-]*-connector$/.test(x.name));
+        for (const item of artifacts) {
+            const itemUrl = this.repositoryUrl(`io/tapdata/${encodeURIComponent(item.name)}/`);
+            const versions = (await this.directoryEntries(itemUrl, signal))
+                .filter(x => x.directory && (!version || x.name === version));
+            for (const entry of versions) {
+                const dir = this.repositoryUrl(`io/tapdata/${encodeURIComponent(item.name)}/${encodeURIComponent(entry.name)}/`);
+                const files = await this.directoryEntries(dir, signal);
+                const jarName = `${item.name}-${entry.name}.jar`;
+                if (!files.some(x => !x.directory && x.name === jarName) || !files.some(x => !x.directory && x.name === `${jarName}.sha256`)) continue;
+                const download = this.repositoryUrl(`io/tapdata/${encodeURIComponent(item.name)}/${encodeURIComponent(entry.name)}/${encodeURIComponent(jarName)}`);
+                const digest = await this.sha256(new URL(`${download.pathname}.sha256`, this.base), signal);
+                found.push({ artifactId: item.name, group: 'io.tapdata', version: entry.name, repository: this.repository, url: download.href, sha256: digest });
             }
-            token = page.continuationToken || undefined;
-            if (token && (tokens.has(token) || tokens.size >= 1000)) throw new Error('Nexus pagination did not complete');
-            if (token) tokens.add(token);
-        } while (token);
+        }
+        found.sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true, sensitivity: 'base' }));
         return found;
     }
     async download(name: string, version?: string, options: ExecutionOptions = {}) {

@@ -32,6 +32,14 @@ function table(rows: any[], columns: [
         clipped += c;
     } return clipped + ' '.repeat(Math.max(0, sizes[i] - width(clipped))); }).join('  ')).join('\n');
 }
+function labelStatus(value: unknown) {
+    const labels: Record<string, string> = {
+        passed: '通过', failed: '失败', 'not-tested': '未测试', loaded: '已加载', stale: '需刷新',
+        partial: '部分加载', 'not-loaded': '未加载', ready: '就绪', running: '运行中',
+        succeeded: '成功', interrupted: '已中断', cancelling: '正在停止'
+    };
+    return labels[String(value)] ?? String(value ?? '—');
+}
 function printable(v: any) {
     if (v?.text)
         return v.text;
@@ -39,20 +47,27 @@ function printable(v: any) {
         if (!v.length)
             return '暂无记录';
         if (v[0].connectorId)
-            return table(v, [['name', '连接名'], ['pdkId', 'PDK'], ['testStatus', '连接测试'], ['modelStatus', '模型'], ['modelCount', '表数']]);
+            return table(v.map(x => ({ ...x, testStatus: labelStatus(x.testStatus), modelStatus: labelStatus(x.modelStatus) })), [['name', '数据源'], ['pdkId', '连接器'], ['testStatus', '连接测试'], ['modelStatus', '模型'], ['modelCount', '表数']]);
         if (v[0].loaded !== undefined)
             return table(v, [['id', '连接器 ID'], ['version', '版本'], ['loaded', '已装载']]);
         if (v[0].planVersion)
-            return table(v, [['name', '任务'], ['status', '状态'], ['table', '源表'], ['written', '已写行数']]);
+            return table(v.map(x => ({ ...x, status: labelStatus(x.status) })), [['name', '任务'], ['status', '状态'], ['table', '源表'], ['written', '已写行数']]);
         if (v[0].provider)
             return table(v, [['name', '绑定名'], ['provider', 'AI'], ['model', '模型']]);
     }
     if (v?.pdkId && v?.capabilities && v?.id)
         return `✓ 已装载 ${v.name} · pdkId: ${v.pdkId} · 版本: ${v.version}\n  ID: ${v.id}\n  能力: ${Object.entries(v.capabilities).filter(([, enabled]) => enabled).map(([name]) => name).join(', ')}${v.notice ? '\n  ' + v.notice : ''}`;
     if (v?.tables)
-        return `${v.tables.length} 张表\n` + table(v.tables.map((t: any) => ({ ...t, count: t.fields.length })), [['id', '表名'], ['count', '字段数']]);
+        return `发现 ${v.tables.length} 张表\n\n` + table(v.tables.map((t: any) => ({ ...t, count: t.fields?.length ?? 0 })), [['id', '表名'], ['count', '字段数']]) + '\n\n查看结构：/datasource describe <连接名> --table <表名> · 查看样例：/datasource sample <连接名> --table <表名>';
+    if (v?.table?.fields) {
+        const t = v.table;
+        const fields = t.fields.map((f: any) => ({ name: f.name ?? f.id, type: f.type ?? f.dataType ?? f.originalType, nullable: f.nullable === undefined ? '—' : f.nullable ? '是' : '否', key: f.primaryKey ? '主键' : '' }));
+        return `${t.id ?? t.name ?? '表结构'} · ${fields.length} 个字段\n\n` + table(fields, [['name', '字段'], ['type', '类型'], ['nullable', '可空'], ['key', '键']]);
+    }
+    if (v?.name && v?.pdkId && v?.config !== undefined)
+        return `数据源  ${v.name}\n连接器  ${v.pdkId}\n连接测试  ${labelStatus(v.testStatus)}\n表模型  ${labelStatus(v.modelStatus)} · ${v.modelCount ?? 0} 张表\n配置修订  #${v.revision}`;
     if (v?.rows)
-        return `${v.count} 行样例（上限 ${v.limit}）\n` + (v.rows.length ? table(v.rows, Object.keys(v.rows[0]).slice(0, 8).map(k => [k, k])) : '暂无记录');
+        return `样例数据  ${v.rows.length} 行${v.count > v.rows.length ? `（共 ${v.count} 行，当前为部分结果）` : ''}\n\n` + (v.rows.length ? table(v.rows, Object.keys(v.rows[0]).slice(0, 8).map(k => [k, k])) : '没有返回记录');
     if (v?.checks)
         return table(v.checks, [['item', '检查项'], ['result', '结果（1通过 / 2警告 / 10失败）'], ['message', '说明']]);
     if (v?.suite && v?.tests)
@@ -138,9 +153,44 @@ async function main() {
     app.interactive = true;
     const historyPath = join(store.home, 'history');
     const history = existsSync(historyPath) ? readFileSync(historyPath, 'utf8').split('\n').filter(Boolean).reverse().slice(0, 200) : [];
-    let rl: Interface = createInterface({ input: process.stdin, output: process.stdout, history, historySize: 200, removeHistoryDuplicates: true, completer: (line: string) => { const choices = commands.map(([name]) => '/' + name); const hits = choices.filter(x => x.startsWith(line)); return [hits, line]; } });
+    const complete = (line: string): [string[], string] => {
+        const words = line.trimStart().split(/\s+/);
+        const slash = words[0]?.startsWith('/');
+        if (!slash) return [[], line];
+        const bare = words.map((x, i) => i === 0 ? x.slice(1) : x);
+        const group = bare[0] ?? '';
+        const action = bare[1] ?? '';
+        const choices = commands.map(([name]) => '/' + name);
+        const options: Record<string, string[]> = {
+            'connector load': ['--jar', '--deps', '--class', '--version', '--repository'],
+            'datasource create': ['--pdk-id', '--connector', '--config', '--set'],
+            'datasource modify': ['--config', '--set'],
+            'datasource load': ['--table', '--refresh'],
+            'datasource describe': ['--table'], 'datasource sample': ['--table', '--limit'],
+            'task create': ['--source', '--table', '--output', '--exclude']
+        };
+        if (words.length >= 3 && words.at(-1) === '') choices.push(...(options[`${group} ${action}`] ?? []).map(x => `/${group} ${action} ${x}`));
+        const dataSources = store.state.datasources.map(x => x.name);
+        if (group === 'datasource' && ['test', 'load', 'describe', 'sample', 'modify', 'drop'].includes(action) && words.length >= 3) {
+            if (action === 'sample' && words.length >= 4 && words[2]) {
+                const ds = store.state.datasources.find(x => x.name === words[2]);
+                choices.push(...(ds?.models ?? []).map((t: any) => `/${group} ${action} ${words[2]} --table ${t.id}`));
+            } else choices.push(...dataSources.map(name => `/${group} ${action} ${name}`));
+        }
+        if (group === 'task' && ['describe', 'status', 'stop', 'start', 'drop'].includes(action) && words.length >= 3)
+            choices.push(...store.state.tasks.map(x => `/task ${action} ${x.name}`));
+        if (group === 'task' && action === 'create' && words.length >= 3 && words[2] === '--source')
+            choices.push(...dataSources.map(name => `/task create --source ${name}`));
+        if (group === 'connector' && ['describe', 'unload', 'update'].includes(action) && words.length >= 3)
+            choices.push(...store.state.connectors.map(x => `/connector ${action} ${x.id}`));
+        const hits = [...new Set(choices)].filter(x => x.startsWith(line));
+        return [hits, line];
+    };
+    let rl: Interface = createInterface({ input: process.stdin, output: process.stdout, history, historySize: 200, removeHistoryDuplicates: true, completer: complete });
     console.log(cyan('\n  tapdatacli') + '  v0.1.0 · AI + PDK Mini Engine\n');
-    console.log('输入自然语言，或 /help 查看命令。Tab 补全 · ↑ 历史 · /exit 退出');
+    console.log('数据库工作区：连接器 · 数据源 · 表结构 · 样例 · 导出任务');
+    console.log('输入自然语言，或输入 / 查看命令。Tab 补全命令、连接名、表名和任务名 · ↑ 历史 · /exit 退出');
+    console.log('常用操作：/connector search · /datasource list · /datasource load <连接名> · /task list');
     console.log('多行输入：行末 \\ 继续；Ctrl+C 停止 AI 回答及当前本地进程，数据任务使用 /task stop。\n');
     const question = (s: string) => new Promise<string>(resolve => rl.question(s, resolve));
     if (!store.state.bindings.length) {
@@ -162,7 +212,11 @@ async function main() {
         }
     }
     console.log(`工作区 ${store.home} · AI ${store.state.activeBinding ?? '未绑定'}\n`);
-    rl.setPrompt(cyan('tapdata › '));
+    const setPrompt = () => {
+        const tableCount = store.state.datasources.reduce((n, ds: any) => n + (ds.models?.length ?? 0), 0);
+        rl.setPrompt(cyan(`tapdata${store.state.datasources.length ? ` [${store.state.datasources.length} 连接 · ${tableCount} 表]` : ''} › `));
+    };
+    setPrompt();
     let busy = false, multiline = '';
     let lastProgress = 0;
     app.notify = text => { if (Date.now() - lastProgress < 500 && text.includes('已写出'))
@@ -193,7 +247,7 @@ async function main() {
         }
         line = multiline + line;
         multiline = '';
-        rl.setPrompt(cyan('tapdata › '));
+        setPrompt();
         if (!line.trim()) {
             rl.prompt();
             return;

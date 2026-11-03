@@ -26,7 +26,7 @@ npm run bundle                  # 可直接解压的 tapdatacli-0.1.0.tar.gz
 
 ## 从 Nexus 自动下载连接器
 
-按名称加载时，CLI 自动从 `https://nexus.tapdata.net` 的 `maven-releases` 查询 `io.tapdata` 下的连接器，下载主 JAR、校验 SHA-256，再交给 Java 引擎检查并装载。无需 Maven，也无需事先准备本地路径。
+按名称加载时，CLI 自动从 `https://nexus.tapdata.net/maven-releases` 的 Maven 仓库目录查询 `io.tapdata` 下的连接器，下载主 JAR、校验仓库提供的 SHA-256，再交给 Java 引擎检查并装载。无需 Maven，也无需事先准备本地路径。这里使用实际提供制品的 Maven 布局索引；Nexus REST 搜索 API 对部分已发布制品会返回空结果。
 
 ```bash
 tapdatacli connector search                 # 查看已发布的连接器和版本
@@ -46,7 +46,7 @@ tapdatacli connector update CONNECTOR_ID --version 1.1.0
 
 | 变量 | 用途 |
 | --- | --- |
-| `TAPDATACLI_NEXUS_URL` | Nexus 服务地址，默认 `https://nexus.tapdata.net` |
+| `TAPDATACLI_NEXUS_URL` | Maven 仓库服务地址，默认 `https://nexus.tapdata.net`；程序按 `/<repository>/io/tapdata/` 读取仓库目录 |
 | `TAPDATACLI_NEXUS_REPOSITORY` | 默认 hosted 仓库，默认 `maven-releases`；命令参数优先 |
 | `TAPDATACLI_NEXUS_TOKEN` | 可选 Bearer token，只从环境变量读取 |
 | `TAPDATACLI_NEXUS_USER` / `TAPDATACLI_NEXUS_PASSWORD` | 可选 Basic 认证；token 优先 |
