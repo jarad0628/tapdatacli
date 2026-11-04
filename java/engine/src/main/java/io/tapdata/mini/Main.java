@@ -6,7 +6,10 @@ import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.logger.TapLog;
 import io.tapdata.entity.schema.*;
 import io.tapdata.entity.utils.DataMap;
+import io.tapdata.entity.utils.cache.Entry;
+import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.entity.utils.cache.KVMap;
+import io.tapdata.entity.utils.cache.KVReadOnlyMap;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.pdk.apis.*;
 import io.tapdata.pdk.apis.annotations.TapConnectorClass;
@@ -98,7 +101,24 @@ public class Main {
     static List<TapTable> discover(TapConnector c,TapConnectorContext ctx,String table) throws Throwable {
         var tables=new ArrayList<TapTable>();
         c.discoverSchema(ctx,table==null?null:List.of(table),100,batch->{if(tables.size()+batch.size()>5000)throw new IllegalArgumentException("More than 5000 tables; select a table");tables.addAll(batch);});
-        var map=new HashMap<String,TapTable>();for(var t:tables)map.put(t.getId(),t);ctx.setTableMap(map::get);return tables;
+        var map=new HashMap<String,TapTable>();for(var t:tables)map.put(t.getId(),t);
+        ctx.setTableMap(new KVReadOnlyMap<>() {
+            public TapTable get(String id) { return map.get(id); }
+            public Iterator<Entry<TapTable>> iterator() {
+                var entries=map.entrySet().iterator();
+                return new Iterator<>() {
+                    public boolean hasNext() { return entries.hasNext(); }
+                    public Entry<TapTable> next() {
+                        var entry=entries.next();
+                        return new Entry<>() {
+                            public String getKey() { return entry.getKey(); }
+                            public TapTable getValue() { return entry.getValue(); }
+                        };
+                    }
+                };
+            }
+        });
+        return tables;
     }
     static Object safeValue(Object v) {
         if(v instanceof Long || v instanceof java.math.BigInteger || v instanceof java.math.BigDecimal)return v.toString();
