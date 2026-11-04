@@ -127,6 +127,11 @@ public class Main {
         if(v instanceof Collection<?> l)return l.stream().map(Main::safeValue).toList();
         return v;
     }
+    static boolean hasRowData(Object value) {
+        JsonNode event=JSON.valueToTree(value);
+        return hasNonEmptyRow(event.get("after")) || hasNonEmptyRow(event.get("before"));
+    }
+    static boolean hasNonEmptyRow(JsonNode row) { return row!=null && row.isObject() && !row.isEmpty(); }
     static String csv(Object v)throws Exception {String s=v==null?"":v instanceof Map||v instanceof Collection?JSON.writeValueAsString(v):v.toString();return "\""+s.replace("\"","\"\"")+"\"";}
     static Object execute(String method,JsonNode p,Operation op,String requestId)throws Throwable {
         if(method.equals("engine.hello"))return obj("protocolVersion",1,"engineVersion","0.1.0","javaVersion",System.getProperty("java.version"));
@@ -203,7 +208,8 @@ public class Main {
                     if(op.cancelled)throw new CancellationException();
                     if(events==null||events.isEmpty())return;
                     var payload=new ArrayList<Object>(events.size());
-                    for(TapEvent event:events){payload.add(JSON.convertValue(safeValue(event),Object.class));seen[0]++;}
+                    for(TapEvent event:events){Object value=safeValue(event);if(hasRowData(value)){payload.add(JSON.convertValue(value,Object.class));seen[0]++;}}
+                    if(payload.isEmpty())return;
                     emit(obj("jsonrpc","2.0","method","stream.records","params",obj("requestId",requestId,"records",payload,"count",seen[0],"offset",safeValue(nextOffset))));
                 });
                 streamFunction.streamRead(ctx,tableList,offset,p.path("recordSize").asInt(20),consumer);

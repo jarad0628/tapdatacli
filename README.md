@@ -94,7 +94,7 @@ CDC 连接器可以用前台订阅查看新事件：
 /datasource stream demo --table customers
 ```
 
-默认以当前时间调用连接器的 `timestampToStreamOffset`（若已注册），再启动 `streamRead` 并逐批显示事件。可用 `--since 2026-11-04T00:00:00Z` 指定起始时间、用 `--record-size 20` 调整请求批量，按 Ctrl+C 请求停止。没有 `timestampToStreamOffset` 时会把 null offset 交给 PDK，连接器可能从最早位置开始。它不会创建 task 或保存检查点，不支持断点续读。
+默认以当前时间调用连接器的 `timestampToStreamOffset`（若已注册），再启动 `streamRead` 并逐批显示带有 `before` 或 `after` 行数据的变更事件；心跳等不含行数据的事件会被忽略，返回计数也只统计展示的数据变更。可用 `--since 2026-11-04T00:00:00Z` 指定起始时间、用 `--record-size 20` 调整请求批量，按 Ctrl+C 请求停止。没有 `timestampToStreamOffset` 时会把 null offset 交给 PDK，连接器可能从最早位置开始。它不会创建 task 或保存检查点，不支持断点续读。
 
 `datasource query` 需要连接器注册 PDK `queryByAdvanceFilter`，然后把过滤器、排序、skip/limit 和字段投影交给连接器执行，不在 CLI 本地模拟。`--filter` 接受 `TapAdvanceFilter` JSON（例如 `{"match":{"status":"active"}}`）；`--sort` 接受包含 `key` 与 `sort`（`asc`/`desc`）的 JSON 数组。缺少此能力时命令会明确拒绝。
 
@@ -130,6 +130,8 @@ tapdatacli ask '查看 demo 的表结构，然后读取 customers 的两条样�
 AI 返回普通文本或不合规 JSON 时，CLI 会自动要求纠正一次；连续失败会显示协议错误，不执行未校验的回复。若用户提供连接器目录，AI 可调用 `/connector discover --dir DIR` 列出该目录的 JAR，再使用真实路径加载。扫描不递归、不加载 JAR，最多返回 200 项；多个版本需要根据实际候选确认，缺少目标 JAR 时会说明缺失。
 
 `/model MODEL_ID` 切换模型；`/ai native` 暂时进入原生 CLI，使用其模型选择、登录等原生能力，退出后返回。原生模式是独立会话，首版不桥接其内部工具和会话历史；需要操作数据时返回 Tapdata。CLI 模型列表自动发现、推理参数、原生会话恢复和 token 级流式响应尚未实现；`/ai models` 会明确给出可用方式。
+
+API 绑定未设置对应的 Key 环境变量时，CLI 仍会正常启动；自然语言请求会提示缺失的变量名和配置方式。此时可输入 `/commands` 查看并继续使用斜杠命令，设置 Key 后即可恢复自然语言操作。Codex 和 Claude 原生 CLI 绑定使用各自的登录状态，不依赖 TapdataCLI API Key。
 
 ### OpenAI-compatible API / DeepSeek / 中转站
 

@@ -214,6 +214,10 @@ async function main() {
             error(e);
         }
     }
+    const activeBinding = store.state.bindings.find(binding => binding.name === store.state.activeBinding);
+    if (activeBinding?.provider === 'api' && !process.env[activeBinding.keyEnv]) {
+        console.log(`未检测到 API Key 环境变量 ${activeBinding.keyEnv}。自然语言 AI 暂不可用，但 CLI 已正常启动；输入 /commands 查看命令，连接器、数据源和任务命令可继续使用。设置该环境变量后，自然语言功能即可使用。`);
+    }
     console.log(`工作区 ${store.home} · AI ${store.state.activeBinding ?? '未绑定'}\n`);
     const setPrompt = () => {
         const tableCount = store.state.datasources.reduce((n, ds: any) => n + (ds.models?.length ?? 0), 0);

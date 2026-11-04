@@ -25,7 +25,7 @@ export class AI {
     private async api(b: RecordData, messages: any[], signal: AbortSignal) {
         const key = process.env[b.keyEnv];
         if (!key)
-            throw new Error(`Set environment variable ${b.keyEnv} before using this API`);
+            throw new Error(`未设置 API Key 环境变量 ${b.keyEnv}，自然语言 AI 暂不可用。仍可直接使用 / 命令操作，例如 /commands 查看列表；配置 Key 后重试自然语言请求。`);
         const response = await fetch(b.url + '/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` }, body: JSON.stringify({ model: b.model, messages, stream: false }), signal: AbortSignal.any([signal, AbortSignal.timeout(120000)]) });
         if (!response.ok)
             throw new Error(`AI API HTTP ${response.status}; verify base URL, model and credentials`);
@@ -132,7 +132,7 @@ export class AI {
     }
     async models(signal: AbortSignal) { const b = this.binding(); if (b.provider !== 'api')
         return { provider: b.provider, model: b.model ?? 'provider default', hint: 'Use /model MODEL_ID to switch, or /ai native to use the provider model picker. Automatic CLI model discovery is not in this prototype.' }; const key = process.env[b.keyEnv]; if (!key)
-        throw new Error(`Set ${b.keyEnv}`); const r = await fetch(b.url + '/models', { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]) }); if (!r.ok)
+        throw new Error(`未设置 API Key 环境变量 ${b.keyEnv}。仍可使用 / 命令；配置 Key 后可重试 /ai models。`); const r = await fetch(b.url + '/models', { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]) }); if (!r.ok)
         throw new Error(`Model discovery HTTP ${r.status}; /model MODEL_ID remains available`); const data: any = await r.json(); return { models: (data.data ?? []).map((x: any) => x.id), selected: b.model }; }
     async native() { const b = this.binding(); if (b.provider === 'api')
         throw new Error('API bindings do not have a native CLI'); if (this.app.running.size)
