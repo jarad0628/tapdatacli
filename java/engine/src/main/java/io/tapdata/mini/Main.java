@@ -11,7 +11,10 @@ import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.pdk.apis.*;
 import io.tapdata.pdk.apis.annotations.TapConnectorClass;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
+import io.tapdata.pdk.apis.entity.*;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
+import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
+import io.tapdata.entity.event.TapEvent;
 import io.tapdata.pdk.apis.spec.TapNodeSpecification;
 import java.io.*;
 import java.net.*;
@@ -28,8 +31,11 @@ public class Main {
     static final Map<String,Plugin> plugins=new HashMap<>();
     static final Map<String,Operation> operations=new ConcurrentHashMap<>();
     static final ExecutorService worker=Executors.newSingleThreadExecutor();
+    static final Map<String,PageCursor> pageCursors=new ConcurrentHashMap<>();
+    record PageCursor(String pdkId,String table,String configKey,Object offset,List<Object> pending) {}
     static class Operation { volatile boolean cancelled; volatile TapConnector connector; volatile TapConnectorContext context; }
     static class StopRead extends RuntimeException {}
+    static class PageStop extends RuntimeException { final String cursor; PageStop(String cursor){this.cursor=cursor;} }
     static class MemoryMap implements KVMap<Object> {
         final ConcurrentHashMap<String,Object> values=new ConcurrentHashMap<>();
         public void init(String k,Class<Object> t) {} public Object get(String k){return values.get(k);}
@@ -74,7 +80,10 @@ public class Main {
                 var manifest=jf.getManifest();
                 String version=props.path("version").asText(manifest==null?"unknown":Objects.toString(manifest.getMainAttributes().getValue("Implementation-Version"),"unknown"));
                 var connector=plug.type.getConstructor().newInstance();var funcs=new ConnectorFunctions();connector.registerCapabilities(funcs,TapCodecsRegistry.create());
-                plug.info=obj("pdkId",id,"version",version,"name",props.path("name").asText(id),"className",plug.type.getName(),"configOptions",plug.spec.path("configOptions"),"capabilities",obj("test",true,"discover",true,"batchRead",funcs.getBatchReadFunction()!=null,"write",funcs.getWriteRecordFunction()!=null));
+                var caps=new LinkedHashMap<String,Object>();
+                caps.put("test",true); caps.put("discover",true);
+                for(var cap:funcs.getCapabilities()) caps.put(cap.getId(),true);
+                plug.info=obj("pdkId",id,"version",version,"name",props.path("name").asText(id),"className",plug.type.getName(),"configOptions",plug.spec.path("configOptions"),"capabilities",caps);
             }
             plugins.put(key,plug);return plug;
         } catch(Throwable e){plug.close();throw e;}
@@ -114,18 +123,138 @@ public class Main {
                 return obj("passed",ok[0]&&!checks.isEmpty(),"checks",checks);
             }
             connector.init(ctx);
+            if(method.equals("datasource.command")) {
+                if(funcs.getExecuteCommandFunction()==null)throw new IllegalArgumentException("Connector does not support execute_command_function");
+                String command=p.path("command").asText(""); if(command.isBlank())throw new IllegalArgumentException("Missing command");
+                var commandResult=new ArrayList<Object>();
+                var request=TapExecuteCommand.create().command(command).params(JSON.convertValue(p.path("commandParams"),new TypeReference<Map<String,Object>>(){})).batchSize(p.path("batchSize").asInt(100));
+                funcs.getExecuteCommandFunction().execute(ctx,request,result->{
+                    if(result.getError()!=null)throw new RuntimeException("Connector command failed: "+result.getError().getMessage());
+                    if(result.getResult()!=null)commandResult.add(safeValue(result.getResult()));
+                    if(commandResult.size()>1000)throw new IllegalArgumentException("Command returned more than 1000 result batches");
+                });
+                return obj("command",command,"results",commandResult,"batches",commandResult.size());
+            }
+            if(method.equals("datasource.sql")) {
+                var function=funcs.getExecuteCommandV2Function();
+                if(function==null)throw new IllegalArgumentException("Connector does not support execute_command_v2_function");
+                String sql=p.path("sql").asText(""); String sqlType=p.path("sqlType").asText("query");
+                if(sql.isBlank())throw new IllegalArgumentException("Missing SQL");
+                if(!sqlType.equals("query")&&!sqlType.equals("execute"))throw new IllegalArgumentException("SQL type must be query or execute");
+                var resultRows=new ArrayList<Object>();var batches=new int[]{0};
+                function.execute(ctx,sqlType,sql,data->{
+                    batches[0]++;
+                    if(data!=null)for(var row:data){if(resultRows.size()>=1000)throw new IllegalArgumentException("SQL returned more than 1000 rows; add a database-side limit");resultRows.add(safeValue(row));}
+                });
+                return obj("sqlType",sqlType,"rows",resultRows,"count",resultRows.size(),"batches",batches[0]);
+            }
+            if(method.equals("datasource.tables")) {
+                var function=funcs.getGetTableNamesFunction();
+                if(function==null)throw new IllegalArgumentException("Connector does not support get_table_names_function");
+                var names=new LinkedHashSet<String>();
+                function.tableNames(ctx,500,batch->{if(batch!=null)names.addAll(batch);if(names.size()>5000)throw new IllegalArgumentException("More than 5000 table names; use datasource load --table");});
+                return obj("tables",new ArrayList<>(names),"count",names.size());
+            }
+            if(method.equals("datasource.tableInfo")) {
+                var function=funcs.getGetTableInfoFunction();
+                if(function==null)throw new IllegalArgumentException("Connector does not support get_table_info_function");
+                String tableName=p.path("table").asText("");if(tableName.isBlank())throw new IllegalArgumentException("Missing table");
+                var result=function.getTableInfo(ctx,tableName);
+                if(result==null)throw new IllegalArgumentException("Connector returned no table information");
+                return obj("table",tableName,"numOfRows",result.getNumOfRows(),"storageSize",result.getStorageSize(),"avgObjSize",result.getAvgObjSize());
+            }
+            if(method.equals("datasource.now")) {
+                var function=funcs.getGetCurrentTimestampFunction();
+                if(function==null)throw new IllegalArgumentException("Connector does not support get_current_timestamp_function");
+                return obj("timestamp",function.now(ctx));
+            }
+            if(method.equals("datasource.streamRead")) {
+                var streamFunction=funcs.getStreamReadFunction();
+                if(streamFunction==null)throw new IllegalArgumentException("Connector does not support stream_read_function");
+                String requestedTable=p.path("table").asText("");
+                List<String> tableList=requestedTable.isBlank()?null:List.of(requestedTable);
+                discover(connector,ctx,requestedTable.isBlank()?null:requestedTable);
+                Object offset=null;
+                long startTime=p.path("startTime").asLong(System.currentTimeMillis());
+                var timestampOffset=funcs.getTimestampToStreamOffsetFunction();
+                if(timestampOffset!=null)offset=timestampOffset.timestampToStreamOffset(ctx,startTime);
+                var seen=new long[]{0};
+                var consumer=StreamReadConsumer.create((events,nextOffset)->{
+                    if(op.cancelled)throw new CancellationException();
+                    if(events==null||events.isEmpty())return;
+                    var payload=new ArrayList<Object>(events.size());
+                    for(TapEvent event:events){payload.add(JSON.convertValue(safeValue(event),Object.class));seen[0]++;}
+                    emit(obj("jsonrpc","2.0","method","stream.records","params",obj("requestId",requestId,"records",payload,"count",seen[0],"offset",safeValue(nextOffset))));
+                });
+                streamFunction.streamRead(ctx,tableList,offset,p.path("recordSize").asInt(20),consumer);
+                return obj("count",seen[0],"startTime",startTime,"usedTimestampOffset",timestampOffset!=null,"ended",true);
+            }
             String table=p.hasNonNull("table")?p.path("table").asText():null;
             var tables=discover(connector,ctx,table);
             if(method.equals("datasource.discover"))return obj("tables",tables.stream().map(t->{
                 var fields=t.getNameFieldMap()==null?List.of():t.getNameFieldMap().values().stream().map(f->obj("name",f.getName(),"type",f.getDataType(),"primaryKey",f.getPrimaryKeyPos())).toList();
                 return obj("id",t.getId(),"name",t.getName(),"fields",fields);
             }).toList());
-            if(!method.equals("datasource.sample")&&!method.equals("task.export"))throw new IllegalArgumentException("Unknown method");
+            if(!Set.of("datasource.sample","datasource.page","datasource.query","datasource.count","datasource.indexes","datasource.constraints","datasource.minmax","task.export").contains(method))throw new IllegalArgumentException("Unknown method");
             if(table==null)throw new IllegalArgumentException("Missing table");
             var tapTable=tables.stream().filter(t->table.equals(t.getId())).findFirst().orElseThrow(()->new IllegalArgumentException("Table not found: "+table));
-            if(funcs.getBatchReadFunction()==null)throw new IllegalArgumentException("Connector has no batchRead capability");
-            boolean exporting=method.equals("task.export");int limit=p.path("limit").asInt(10);
-            if(!exporting&&(limit<1||limit>100))throw new IllegalArgumentException("Sample limit must be 1..100");
+            if(method.equals("datasource.count")) {
+                var function=funcs.getBatchCountFunction();
+                if(function==null)throw new IllegalArgumentException("Connector does not support batch_count_function");
+                return obj("table",table,"count",function.count(ctx,tapTable));
+            }
+            if(method.equals("datasource.indexes")) {
+                var function=funcs.getQueryIndexesFunction();
+                if(function==null)throw new IllegalArgumentException("Connector does not support query_indexes_function");
+                var result=new Object[]{null};function.query(ctx,tapTable,x->result[0]=x);
+                return obj("table",table,"indexes",result[0]==null?List.of():JSON.convertValue(result[0],Object.class));
+            }
+            if(method.equals("datasource.constraints")) {
+                var function=funcs.getQueryConstraintsFunction();
+                if(function==null)throw new IllegalArgumentException("Connector does not support query_constraints_function");
+                var result=new Object[]{null};function.query(ctx,tapTable,x->result[0]=x);
+                return obj("table",table,"constraints",result[0]==null?List.of():JSON.convertValue(result[0],Object.class));
+            }
+            if(method.equals("datasource.minmax")) {
+                var function=funcs.getQueryFieldMinMaxValueFunction();
+                if(function==null)throw new IllegalArgumentException("Connector does not support query_field_min_max_value_function");
+                String field=p.path("field").asText("");if(field.isBlank())throw new IllegalArgumentException("Missing field");
+                TapAdvanceFilter filter=p.hasNonNull("filter")?JSON.treeToValue(p.path("filter"),TapAdvanceFilter.class):TapAdvanceFilter.create();
+                var result=function.minMaxValue(ctx,tapTable,filter,field);
+                return obj("table",table,"field",field,"value",result==null?null:JSON.convertValue(result,Object.class));
+            }
+            boolean querying=method.equals("datasource.query");
+            if(querying&&funcs.getQueryByAdvanceFilterFunction()==null)throw new IllegalArgumentException("Connector does not support query_by_advance_filter_function");
+            if(!querying&&funcs.getBatchReadFunction()==null)throw new IllegalArgumentException("Connector has no batchRead capability");
+            boolean exporting=method.equals("task.export"), paging=method.equals("datasource.page");int limit=p.path("limit").asInt(10);
+            if(!exporting&&(limit<1||limit>100))throw new IllegalArgumentException("Read limit must be 1..100");
+            if(querying) {
+                TapAdvanceFilter filter=p.hasNonNull("filter")?JSON.treeToValue(p.path("filter"),TapAdvanceFilter.class):TapAdvanceFilter.create();
+                filter.setLimit(limit); filter.setBatchSize(limit); filter.setSkip(p.path("skip").asInt(0));
+                if(p.hasNonNull("sort")) filter.setSortOnList(JSON.convertValue(p.path("sort"),new TypeReference<List<SortOn>>(){}));
+                if(p.hasNonNull("projection")) {
+                    var projection=Projection.create();
+                    p.path("projection").path("includeFields").forEach(x->projection.include(x.asText()));
+                    p.path("projection").path("excludeFields").forEach(x->projection.exclude(x.asText()));
+                    filter.setProjection(projection);
+                }
+                var result=new FilterResults[1];
+                funcs.getQueryByAdvanceFilterFunction().query(ctx,filter,tapTable,x->result[0]=x);
+                if(result[0]==null)throw new IllegalArgumentException("Connector query returned no result");
+                if(result[0].getError()!=null)throw new RuntimeException("Connector query failed: "+result[0].getError().getMessage());
+                var found=result[0].getResults()==null?List.<Object>of():result[0].getResults().stream().limit(limit).map(Main::safeValue).toList();
+                return obj("rows",found,"count",found.size(),"limit",limit,"skip",filter.getSkip(),"sort",filter.getSortOnList());
+            }
+            String configKey=JSON.writeValueAsString(obj("config",p.path("config"),"jar",p.path("jar"),"className",p.path("className"),"dependencies",p.path("dependencies")));
+            Object startOffset=null;
+            List<Object> pendingRows=new ArrayList<>();
+            if(paging&&p.hasNonNull("cursor")) {
+                PageCursor cursor=pageCursors.remove(p.path("cursor").asText());
+                if(cursor==null)throw new IllegalArgumentException("Page cursor expired; restart without --cursor");
+                if(!cursor.pdkId().equals(p.path("pdkId").asText())||!cursor.table().equals(table)||!cursor.configKey().equals(configKey))throw new IllegalArgumentException("Page cursor does not match this datasource and table");
+                startOffset=cursor.offset();
+                pendingRows.addAll(cursor.pending());
+            }
             var rows=new ArrayList<Object>();var count=new long[]{0};var columns=new ArrayList<>(tapTable.getNameFieldMap().keySet());
             var excludes=new HashSet<String>();p.path("exclude").forEach(x->excludes.add(x.asText()));if(!columns.containsAll(excludes))throw new IllegalArgumentException("Unknown excluded field; inspect table metadata first");columns.removeAll(excludes);
             if(exporting&&columns.isEmpty())throw new IllegalArgumentException("Export has no columns");
@@ -134,22 +263,41 @@ public class Main {
             if(exporting&&Files.exists(output))throw new IllegalArgumentException("Output exists; choose a new path");
             try(BufferedWriter writer=exporting?Files.newBufferedWriter(partial,StandardCharsets.UTF_8,StandardOpenOption.CREATE_NEW):null) {
                 if(exporting){writer.write(String.join(",",columns.stream().map(x->{try{return csv(x);}catch(Exception e){throw new RuntimeException(e);}}).toList()));writer.newLine();}
+                while(paging&&!pendingRows.isEmpty()&&count[0]<limit){rows.add(pendingRows.remove(0));count[0]++;}
+                if(paging&&count[0]>=limit) {
+                    if(pageCursors.size()>1000)pageCursors.clear();String token=UUID.randomUUID().toString();
+                    pageCursors.put(token,new PageCursor(p.path("pdkId").asText(),table,configKey,startOffset,new ArrayList<>(pendingRows)));
+                    startOffset=token;
+                }
+                String[] nextCursor={null};Object readOffset=startOffset;
                 try {
-                    funcs.getBatchReadFunction().batchRead(ctx,tapTable,null,exporting?500:limit,(events,offset)->{
+                    if(!paging||count[0]<limit)funcs.getBatchReadFunction().batchRead(ctx,tapTable,readOffset,exporting?500:limit,(events,nextOffset)->{
                         if(op.cancelled)throw new CancellationException();
                         for(var event:events)if(event instanceof TapInsertRecordEvent insert){
-                            if(!exporting&&count[0]>=limit)throw new StopRead();
                             @SuppressWarnings("unchecked") var row=(Map<String,Object>)safeValue(insert.getAfter());
+                            if(paging&&count[0]>=limit){pendingRows.add(row);continue;}
+                            if(!exporting&&count[0]>=limit)throw new StopRead();
                             if(exporting)try {var values=new ArrayList<String>();for(String col:columns)values.add(csv(row.get(col)));writer.write(String.join(",",values));writer.newLine();}catch(Exception e){throw new RuntimeException(e);}
                             else rows.add(row);count[0]++;
                         }
                         if(exporting)emit(obj("jsonrpc","2.0","method","task.progress","params",obj("requestId",requestId,"written",count[0],"output",output.toString())));
-                        if(!exporting&&count[0]>=limit)throw new StopRead();
+                        if(!exporting&&count[0]>=limit) {
+                            if(paging&&nextOffset!=null) {
+                                if(pageCursors.size()>1000)pageCursors.clear();
+                                String token=UUID.randomUUID().toString();
+                                pageCursors.put(token,new PageCursor(p.path("pdkId").asText(),table,configKey,nextOffset,new ArrayList<>(pendingRows)));
+                                nextCursor[0]=token;
+                                throw new PageStop(token);
+                            }
+                            throw new StopRead();
+                        }
                     });
-                }catch(StopRead finished){}
+                }catch(StopRead finished){}catch(PageStop finished){}
                 if(op.cancelled)throw new CancellationException();
+                if(paging&&nextCursor[0]!=null)startOffset=nextCursor[0];
             }
             if(exporting){Files.move(partial,output);return obj("written",count[0],"output",output.toString());}
+            if(paging)return obj("rows",rows,"count",count[0],"limit",limit,"cursor",startOffset);
             return obj("rows",rows,"count",count[0],"limit",limit);
         } finally {
             try{connector.stop(ctx);}catch(Throwable e){System.err.println("Connector stop failed: "+e.getClass().getSimpleName());}

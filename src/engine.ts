@@ -73,7 +73,7 @@ export class Engine extends EventEmitter {
             this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
         });
     }
-    async request(method: string, params: any, id?: string) { await this.start(); return this.send(method, params, id, method === 'task.export' ? 24 * 60 * 60 * 1000 : 120000); }
+    async request(method: string, params: any, id?: string) { await this.start(); return this.send(method, params, id, ['task.export', 'datasource.streamRead'].includes(method) ? 24 * 60 * 60 * 1000 : 120000); }
     close() { const child = this.child; if (!child)
         return; child.stdin.end(); const timer = setTimeout(() => child.kill('SIGKILL'), 1500); timer.unref(); child.once('exit', () => clearTimeout(timer)); }
 }

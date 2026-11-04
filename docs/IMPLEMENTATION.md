@@ -90,3 +90,9 @@ MySQL 检查制品为 `/home/tapdata-connectors/connectors/mysql-connector/targe
 REPL 提示增加连接数和已加载表数。Tab 补全除命令外，也提供数据源、任务、连接器引用、表名与常见选项；启动提示展示连接器、数据源、表结构、样例和导出任务等工作区入口。数据源列表/详情、模型发现、表结构和样例使用可扫读的列与状态标签。
 
 本轮仅运行 `npm run build:ts`，TypeScript 编译通过；未运行测试套件，也未做 PTY 人工输入法体验验收。当前仍为 readline 原型，完整多面板 TUI、持续显示的下拉建议及稳定的终端缩放布局尚未实现。
+
+## 只读结果分页（2026-11-03）
+
+新增 `datasource page NAME --table TABLE [--limit 20] [--cursor TOKEN]`。分页复用连接器的 `batchRead` offset；默认每页 20 行，最多 100 行。游标为 Mini Engine 进程内不透明引用，限制在同一连接器制品、连接配置和表上使用，退出会话后失效。结果按连接器返回顺序展示；尚无通用筛选、排序、数据库端 limit 下推或 SQL 执行能力。达到 1000 个缓存游标时会清理游标缓存，较早的页面链接可能失效。
+
+`npm run build` 的 TypeScript 与 Maven 打包通过；未运行测试套件或真实数据库分页验证。运行时效果仍需用支持 offset 的真实连接器验证。

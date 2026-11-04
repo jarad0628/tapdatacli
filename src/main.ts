@@ -67,7 +67,7 @@ function printable(v: any) {
     if (v?.name && v?.pdkId && v?.config !== undefined)
         return `数据源  ${v.name}\n连接器  ${v.pdkId}\n连接测试  ${labelStatus(v.testStatus)}\n表模型  ${labelStatus(v.modelStatus)} · ${v.modelCount ?? 0} 张表\n配置修订  #${v.revision}`;
     if (v?.rows)
-        return `样例数据  ${v.rows.length} 行${v.count > v.rows.length ? `（共 ${v.count} 行，当前为部分结果）` : ''}\n\n` + (v.rows.length ? table(v.rows, Object.keys(v.rows[0]).slice(0, 8).map(k => [k, k])) : '没有返回记录');
+        return `${v.cursor ? '查询结果' : '样例数据'}  ${v.rows.length} 行${v.count > v.rows.length ? `（共 ${v.count} 行，当前为部分结果）` : ''}\n\n` + (v.rows.length ? table(v.rows, Object.keys(v.rows[0]).slice(0, 8).map(k => [k, k])) : '没有返回记录') + (v.cursor ? `\n\n下一页：/datasource page <连接名> --table <表名> --cursor ${v.cursor}` : '');
     if (v?.checks)
         return table(v.checks, [['item', '检查项'], ['result', '结果（1通过 / 2警告 / 10失败）'], ['message', '说明']]);
     if (v?.suite && v?.tests)
@@ -97,6 +97,8 @@ async function main() {
     let abort: AbortController | undefined;
     process.on('SIGINT', () => { if (!app?.interactive) { abort?.abort(); app?.local.close(); } });
     const dispatch = async (argv: string[]) => {
+        if (argv[0] === 'datasource' && argv[1] === 'stream' && !app!.interactive)
+            app!.notify = text => process.stdout.write(json ? JSON.stringify({ event: 'stream', message: text }) + '\n' : text + '\n');
         if (argv[0] === 'ask') {
             abort = new AbortController();
             try {
@@ -112,7 +114,7 @@ async function main() {
         if (argv[0] === 'ai' && argv[1] === 'native')
             return ai.native();
         let result;
-        if (argv[0] === 'local' || argv[0] === 'connector' || argv[0] === 'test') {
+        if (argv[0] === 'local' || argv[0] === 'connector' || argv[0] === 'test' || (argv[0] === 'datasource' && argv[1] === 'stream')) {
             abort = new AbortController();
             try { result = await app!.execute(argv, { signal: abort.signal, onOutput: text => { if (!json) process.stdout.write(text); } }); }
             finally { abort = undefined; }
@@ -165,14 +167,15 @@ async function main() {
             'connector load': ['--jar', '--deps', '--class', '--version', '--repository'],
             'datasource create': ['--pdk-id', '--connector', '--config', '--set'],
             'datasource modify': ['--config', '--set'],
-            'datasource load': ['--table', '--refresh'],
+            'datasource load': ['--table', '--refresh'], 'datasource page': ['--table', '--limit', '--cursor'], 'datasource stream': ['--table', '--since', '--record-size'],
             'datasource describe': ['--table'], 'datasource sample': ['--table', '--limit'],
+            'datasource query': ['--table', '--filter', '--sort', '--skip', '--limit', '--fields'], 'datasource sql': ['--type', '--sql', '--yes'], 'datasource command': ['--command', '--params', '--yes'],
             'task create': ['--source', '--table', '--output', '--exclude']
         };
         if (words.length >= 3 && words.at(-1) === '') choices.push(...(options[`${group} ${action}`] ?? []).map(x => `/${group} ${action} ${x}`));
         const dataSources = store.state.datasources.map(x => x.name);
-        if (group === 'datasource' && ['test', 'load', 'describe', 'sample', 'modify', 'drop'].includes(action) && words.length >= 3) {
-            if (action === 'sample' && words.length >= 4 && words[2]) {
+        if (group === 'datasource' && ['test', 'load', 'describe', 'sample', 'page', 'stream', 'query', 'sql', 'command', 'modify', 'drop'].includes(action) && words.length >= 3) {
+            if (['sample', 'query', 'stream'].includes(action) && words.length >= 4 && words[2]) {
                 const ds = store.state.datasources.find(x => x.name === words[2]);
                 choices.push(...(ds?.models ?? []).map((t: any) => `/${group} ${action} ${words[2]} --table ${t.id}`));
             } else choices.push(...dataSources.map(name => `/${group} ${action} ${name}`));
@@ -191,7 +194,7 @@ async function main() {
     console.log('数据库工作区：连接器 · 数据源 · 表结构 · 样例 · 导出任务');
     console.log('输入自然语言，或输入 / 查看命令。Tab 补全命令、连接名、表名和任务名 · ↑ 历史 · /exit 退出');
     console.log('常用操作：/connector search · /datasource list · /datasource load <连接名> · /task list');
-    console.log('多行输入：行末 \\ 继续；Ctrl+C 停止 AI 回答及当前本地进程，数据任务使用 /task stop。\n');
+    console.log('多行输入：行末 \\ 继续；Ctrl+C 停止当前操作，数据任务使用 /task stop。\n');
     const question = (s: string) => new Promise<string>(resolve => rl.question(s, resolve));
     if (!store.state.bindings.length) {
         console.log('首次使用：绑定 AI 后可以用自然语言操作，稍后也可用 /ai bind 配置。');
@@ -224,7 +227,7 @@ async function main() {
         rl.prompt(true); };
     rl.on('SIGINT', () => { if (abort) {
         abort.abort();
-        console.log('\n已请求停止 AI 回答和当前本地进程；数据任务通过 /task status 查看。');
+        console.log(app?.streamRequestId ? '\n已请求停止 streamRead；正在等待连接器关闭。' : '\n已请求停止 AI 回答或当前本地进程。');
     }
     else if (busy) {
         console.log('\n操作仍在运行；任务使用 /task stop 取消。');

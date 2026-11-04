@@ -64,14 +64,45 @@ tapdatacli init
 tapdatacli connector load --jar ./runtime/local-json-connector.jar
 tapdatacli datasource create demo --pdk-id local-json --set "path=$PWD/examples/customers.json"
 tapdatacli datasource test demo
+tapdatacli datasource capabilities demo
 tapdatacli datasource load demo
 tapdatacli datasource describe demo --table customers
 tapdatacli datasource sample demo --table customers --limit 2
+tapdatacli datasource page demo --table customers --limit 2
+tapdatacli datasource count demo --table customers
+tapdatacli datasource query demo --table customers --filter '{"match":{"status":"active"}}' --sort '[{"key":"created_at","sort":"desc"}]' --limit 20 --fields id,name,status
+tapdatacli datasource sql demo --type query --sql 'SELECT id,name FROM customers LIMIT 20' --yes
+tapdatacli datasource command demo --command 'show databases' --params '{}' --yes
 tapdatacli task create export-customers --source demo --table customers --output /tmp/customers.csv --exclude phone
 tapdatacli task start export-customers
 ```
 
 输出为真实的三行中文客户数据，CSV 不含 phone。目标文件或同名 `.partial` 已存在会返回错误，选择新路径重试。失败或取消时可能保留 `.partial`，不自动续传或覆盖。
+
+`datasource page` 按连接器返回顺序读取最多 100 行；若返回游标，可在同一个交互会话继续下一页：
+
+```text
+/datasource page demo --table customers --limit 20
+/datasource page demo --table customers --limit 20 --cursor <上次结果中的游标>
+```
+
+游标保存在当前 Mini Engine 会话内，退出 CLI 后失效。`page` 走连接器 `batchRead`，不保证数据库端分页。
+
+CDC 连接器可以用前台订阅查看新事件：
+
+```text
+/datasource stream demo --table customers
+```
+
+默认以当前时间调用连接器的 `timestampToStreamOffset`（若已注册），再启动 `streamRead` 并逐批显示事件。可用 `--since 2026-11-04T00:00:00Z` 指定起始时间、用 `--record-size 20` 调整请求批量，按 Ctrl+C 请求停止。没有 `timestampToStreamOffset` 时会把 null offset 交给 PDK，连接器可能从最早位置开始。它不会创建 task 或保存检查点，不支持断点续读。
+
+`datasource query` 需要连接器注册 PDK `queryByAdvanceFilter`，然后把过滤器、排序、skip/limit 和字段投影交给连接器执行，不在 CLI 本地模拟。`--filter` 接受 `TapAdvanceFilter` JSON（例如 `{"match":{"status":"active"}}`）；`--sort` 接受包含 `key` 与 `sort`（`asc`/`desc`）的 JSON 数组。缺少此能力时命令会明确拒绝。
+
+`datasource command` 需要 PDK `executeCommand`，命令名称和参数由连接器定义，请先查看对应连接器说明。该接口可能产生写入等副作用，必须显式传入 `--yes`；CLI 不会把它假定为只读 SQL。
+
+`datasource sql` 需要连接器注册 PDK `executeCommandV2`。`--type query` 返回最多 1000 行；`--type execute` 执行语句。由于连接器未必能可靠区分 SQL 是否有副作用，两种类型都要求显式 `--yes`。连接器没有该能力时命令会拒绝执行。
+
+`datasource capabilities NAME` 会按当前 JAR 的 `registerCapabilities` 结果显示全部已注册 API，并指出已有 CLI 入口。已适配的探查操作还包括：`tables`（`getTableNames`）、`table-info`（行数/存储估算）、`count`（`batchCount`）、`indexes`、`constraints`、`minmax` 和 `now`。每项操作由引擎按实际注册能力校验；详情和未独立适配的流式/事务/DDL 生命周期接口见 [PDK 能力映射](docs/PDK-CAPABILITY-MAP.md)。
 
 所有命令也可在交互会话中使用 `/connector ...`、`/datasource ...`、`/task ...`。不加子命令可列出该组资源。`/help` 查看完整命令；Tab 补全命令、↑ 查历史、行末 `\` 继续多行、`/clear` 清空当前 AI 对话、`/exit` 退出。
 
